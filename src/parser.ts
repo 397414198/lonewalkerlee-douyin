@@ -1,333 +1,392 @@
-/** 抖音视频解析核心逻辑
- *
- * 解析策略（2026 年更新）：
- * - www.douyin.com 已启用 JS VM 保护，RENDER_DATA 不再服务端渲染
- * - 主路径：iesdouyin.com/share/video/{id} 的 window._ROUTER_DATA
- * - 备选：抖音内部 API（需要有效 Cookie + 签名，当前受限）
- */
+/** Cloudflare Worker 主入口 - 路由分发与请求处理 */
 
-import type {
-  VideoInfo,
-  IesdouyinItem,
-  IesdouyinRouterData,
-  DouyinApiResponse,
-  DouyinAwemeDetail,
-  ParsedUrlResult,
-} from './types';
-import {
-  getDouyinApiHeaders,
-  extractVideoId,
-  extractCleanUrl,
-  ensureHttps,
-  toWatermarkFreeUrl,
-  isDouyinUrl,
-  MOBILE_USER_AGENT,
-} from './utils';
+import { parseDouyinVideo } from './parser';
+import { successResponse, errorResponse, optionsResponse } from './utils';
+
+/** Workers 环境变量绑定 */
+interface Env {}
+
+/** 前端页面 HTML */
+import PLAYER_HTML from './player.html';
+
+/** 赵乃吉 sec_user_id */
+const NAIJI_SEC_USER_ID =
+  'MS4wLjABAAAAMzF2DXTalH_LLD9WcbmgMT_lCLg3Prt7xLxHDNBCs0Y';
+
+/** Worker 入口 */
+export default {
+  async fetch(request: Request, _env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const { pathname } = url;
+
+    // CORS 预检
+    if (request.method === 'OPTIONS') {
+      return optionsResponse();
+    }
+
+    switch (pathname) {
+      case '/':
+        return handleIndex();
+
+      case '/api/parse':
+        return handleParse(request, url);
+
+      case '/api/proxy':
+        return handleProxy(url);
+
+      case '/api/health':
+        return handleHealth();
+
+      // 🆕 赵乃吉最新作品
+      case '/api/naiji':
+        return handleNaiji(request);
+
+      default:
+        return errorResponse('接口不存在', 404);
+    }
+  },
+} satisfies ExportedHandler<Env>;
 
 /**
- * 解析抖音分享链接，获取视频信息
- * 解析流程：
- * 1. 跟踪短链重定向获取 iesdouyin 分享页 URL 和视频 ID
- * 2. 优先从 iesdouyin 分享页的 _ROUTER_DATA 提取视频信息
- * 3. 备选：调用抖音内部 API 获取视频详情
- * @param shareUrl - 抖音分享链接
- * @returns 解析后的视频信息
- * @throws 解析失败时抛出错误
+ * 首页
  */
-export async function parseDouyinVideo(shareUrl: string): Promise<VideoInfo> {
-  // Step 1: 校验链接
-  if (!isDouyinUrl(shareUrl)) {
-    throw new Error('无效的抖音链接，请检查链接格式');
+function handleIndex(): Response {
+  return new Response(PLAYER_HTML, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+    },
+  });
+}
+
+/**
+ * 原有视频解析接口
+ *
+ * GET /api/parse?url=<douyin_share_url>
+ */
+async function handleParse(
+  request: Request,
+  url: URL
+): Promise<Response> {
+  if (request.method !== 'GET') {
+    return errorResponse('仅支持 GET 请求', 405);
   }
 
-  // Step 2: 跟踪重定向，获取长链接和视频 ID
-  const parsedUrl = await resolveShortUrl(shareUrl);
-  if (!parsedUrl.videoId) {
-    throw new Error('无法从链接中提取视频ID，请确认链接是否正确');
-  }
+  const douyinUrl = url.searchParams.get('url');
 
-  // Step 3: 尝试多种方式获取视频详情
-  let videoInfo: VideoInfo | null = null;
-  let lastError: string | null = null;
-
-  // 方式一：从 iesdouyin 分享页的 _ROUTER_DATA 中提取（主路径）
-  try {
-    videoInfo = await parseFromIesdouyin(parsedUrl.videoId);
-  } catch (err) {
-    lastError = err instanceof Error ? err.message : '_ROUTER_DATA 解析失败';
-    // 如果是"视频不存在"类的确定性错误，直接抛出，不再尝试 API
-    if (isVideoNotFoundError(lastError)) {
-      throw new Error(lastError);
-    }
-  }
-
-  // 方式二：调用抖音内部 API（受限，需要有效 Cookie + 签名）
-  if (!videoInfo) {
-    try {
-      videoInfo = await parseFromApi(parsedUrl.videoId);
-    } catch (err) {
-      const apiError = err instanceof Error ? err.message : 'API 解析失败';
-      lastError = lastError ? `${lastError} | ${apiError}` : apiError;
-    }
-  }
-
-  if (!videoInfo) {
-    throw new Error(
-      lastError || '视频解析失败，可能是因为抖音接口变更或视频已被删除。请稍后重试或更换链接'
+  if (!douyinUrl) {
+    return errorResponse(
+      '缺少必要参数: url。用法: /api/parse?url=<抖音分享链接>'
     );
   }
 
-  return videoInfo;
+  const decodedUrl = douyinUrl.trim();
+
+  try {
+    const videoInfo = await parseDouyinVideo(decodedUrl);
+    return successResponse(videoInfo);
+  } catch (err) {
+    const errorMessage =
+      err instanceof Error ? err.message : '未知错误';
+
+    return errorResponse(errorMessage, 500);
+  }
 }
 
 /**
- * 判断错误信息是否为"视频不存在"类的确定性错误
- * 这类错误不应再尝试其他解析方式，应直接返回给用户
- * @param errorMsg - 错误信息
- * @returns 是否为确定性错误
+ * 视频代理
+ *
+ * GET /api/proxy?url=<cdn_url>
  */
-function isVideoNotFoundError(errorMsg: string): boolean {
-  const notFoundKeywords = [
-    '已被删除',
-    '设为私密',
-    '权限',
-    '不见了',
-    '无法观看',
-    '信息为空',
-  ];
-  return notFoundKeywords.some((kw) => errorMsg.includes(kw));
-}
+async function handleProxy(url: URL): Promise<Response> {
+  const targetUrl = url.searchParams.get('url');
 
-/**
- * 跟踪短链重定向，获取最终长链接并提取视频 ID
- * 移动端 UA 的短链会直接 302 到 iesdouyin.com/share/video/{id}
- * @param shareUrl - 抖音分享短链接
- * @returns 包含视频 ID 和长链接的解析结果
- */
-async function resolveShortUrl(shareUrl: string): Promise<ParsedUrlResult> {
-  // 先尝试从原始 URL 提取视频 ID（用户可能直接传入长链接）
-  const directVideoId = extractVideoId(shareUrl);
-  if (directVideoId) {
-    // 如果已有视频 ID，直接构造 iesdouyin 分享页 URL
-    return {
-      videoId: directVideoId,
-      longUrl: `https://www.iesdouyin.com/share/video/${directVideoId}`,
-    };
+  if (!targetUrl) {
+    return errorResponse('缺少必要参数: url', 400);
   }
 
-  // 短链需要跟踪重定向（使用移动端 UA，会直接跳转到 iesdouyin）
-  const response = await fetch(shareUrl, {
-    method: 'GET',
-    headers: {
-      'User-Agent': MOBILE_USER_AGENT,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    redirect: 'manual',
-  });
-
-  // 抖音短链可能经过多次 302 重定向
-  let currentUrl = shareUrl;
-  let currentResponse: Response = response;
-  const maxRedirects = 10;
-  let redirectCount = 0;
-
-  while (
-    (currentResponse.status === 301 ||
-      currentResponse.status === 302 ||
-      currentResponse.status === 307 ||
-      currentResponse.status === 308) &&
-    redirectCount < maxRedirects
-  ) {
-    const location = currentResponse.headers.get('location');
-    if (!location) {
-      break;
-    }
-
-    // 处理相对路径的重定向
-    currentUrl = new URL(location, currentUrl).href;
-
-    // 尝试从重定向 URL 中提取视频 ID
-    const videoId = extractVideoId(currentUrl);
-    if (videoId) {
-      return { videoId, longUrl: currentUrl };
-    }
-
-    // 继续跟踪重定向
-    currentResponse = await fetch(currentUrl, {
-      method: 'GET',
+  try {
+    const response = await fetch(targetUrl, {
       headers: {
-        'User-Agent': MOBILE_USER_AGENT,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        Referer: 'https://www.douyin.com/',
+        'User-Agent':
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
       },
-      redirect: 'manual',
     });
 
-    redirectCount++;
-  }
+    const headers = new Headers();
 
-  // 最终 URL 仍未提取到视频 ID，尝试从最终响应的 HTML 中查找
-  if (currentResponse.status === 200) {
-    const html = await currentResponse.text();
-    const videoId = extractVideoIdFromHtml(html);
-    if (videoId) {
-      return { videoId, longUrl: currentUrl };
+    const copyHeaders = [
+      'content-type',
+      'content-length',
+      'content-range',
+      'accept-ranges',
+      'cache-control',
+      'etag',
+      'last-modified',
+    ];
+
+    for (const h of copyHeaders) {
+      const v = response.headers.get(h);
+
+      if (v) {
+        headers.set(h, v);
+      }
     }
-  }
 
-  return { videoId: '', longUrl: currentUrl };
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } catch (e) {
+    return errorResponse(
+      '代理视频流失败: ' +
+        (e instanceof Error ? e.message : String(e)),
+      500
+    );
+  }
 }
 
 /**
- * 从 HTML 内容中提取视频 ID
- * @param html - 网页 HTML 内容
- * @returns 视频 ID，未找到返回 null
+ * 健康检查
  */
-function extractVideoIdFromHtml(html: string): string | null {
-  const patterns = [
-    /"aweme_id"\s*:\s*"(\d+)"/,
-    /"itemId"\s*:\s*"(\d+)"/,
-    /\/video\/(\d+)/,
-    /modal_id=(\d+)/,
-  ];
-
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match) {
-      return match[1];
-    }
-  }
-
-  return null;
-}
-
-/**
- * 从 iesdouyin 分享页的 _ROUTER_DATA 中提取视频信息
- * 这是当前（2026）唯一可靠的服务端解析路径
- * @param videoId - 视频 ID
- * @returns 视频信息
- */
-async function parseFromIesdouyin(videoId: string): Promise<VideoInfo> {
-  const shareUrl = `https://www.iesdouyin.com/share/video/${videoId}`;
-
-  const response = await fetch(shareUrl, {
-    method: 'GET',
-    headers: {
-      'User-Agent': MOBILE_USER_AGENT,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-    },
+function handleHealth(): Response {
+  return successResponse({
+    status: 'healthy',
+    service: 'douyin-video-parser',
+    version: '1.1.0',
   });
-
-  if (!response.ok) {
-    throw new Error(`请求 iesdouyin 页面失败: HTTP ${response.status}`);
-  }
-
-  const html = await response.text();
-
-  // 提取 window._ROUTER_DATA
-  const routerDataMatch = html.match(
-    /window\._ROUTER_DATA\s*=\s*/
-  );
-
-  if (!routerDataMatch) {
-    throw new Error('未在页面中找到 _ROUTER_DATA');
-  }
-
-  // 手动解析 JSON（需要处理嵌套大括号）
-  const jsonStr = extractJsonObject(html, routerDataMatch.index! + routerDataMatch[0].length);
-  if (!jsonStr) {
-    throw new Error('_ROUTER_DATA JSON 解析失败');
-  }
-
-  const routerData = JSON.parse(jsonStr) as IesdouyinRouterData;
-
-  // 在 loaderData 中查找包含 videoInfoRes 的键
-  // 键名格式：video_(id)/page
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const loaderData = (routerData as any).loaderData;
-  let videoInfoRes: {
-    item_list: IesdouyinItem[];
-    filter_list?: { notice?: string; detail_msg?: string }[];
-  } | null = null;
-
-  for (const key of Object.keys(loaderData)) {
-    const loader = loaderData[key];
-    if (loader && typeof loader === 'object' && 'videoInfoRes' in loader) {
-      videoInfoRes = loader.videoInfoRes;
-      break;
-    }
-  }
-
-  if (!videoInfoRes) {
-    throw new Error('_ROUTER_DATA 中未找到 videoInfoRes');
-  }
-
-  // 检查视频是否被删除/私密
-  if (!videoInfoRes.item_list || videoInfoRes.item_list.length === 0) {
-    // 尝试从 filter_list 获取原因
-    const filterList = videoInfoRes.filter_list;
-    if (filterList && filterList.length > 0) {
-      const filter = filterList[0];
-      throw new Error(filter.detail_msg || filter.notice || '视频已被删除或设为私密');
-    }
-    throw new Error('视频信息为空，可能已被删除或设为私密');
-  }
-
-  const item = videoInfoRes.item_list[0];
-  const videoInfo = mapIesdouyinItemToVideoInfo(item);
-
-  // 跟随 302 获取真实 CDN 播放地址（浏览器直接访问 302 链接会被 CDN 拦截）
-  if (videoInfo.playAddr) {
-    try {
-      videoInfo.playAddr = await resolveRedirect(videoInfo.playAddr);
-    } catch {
-      // 解析失败则保留原始链接
-    }
-  }
-
-  return videoInfo;
 }
 
 /**
- * 跟随 302 重定向，获取最终 URL
- * 抖音的 playAddr 是 302 跳转链接，浏览器直接访问会被 CDN 拦截
- * 需要服务端跟随重定向获取真实 CDN 地址
- * @param url - 可能重定向的 URL
- * @returns 最终的直链 URL
+ * 🆕 赵乃吉最新作品接口
+ *
+ * GET /api/naiji
+ *
+ * 通过 iesdouyin 用户分享页获取 _ROUTER_DATA，
+ * 从其中递归寻找作品数据，并按照 create_time
+ * 找到最新的一条。
  */
-async function resolveRedirect(url: string): Promise<string> {
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'User-Agent': MOBILE_USER_AGENT,
-    },
-    redirect: 'manual',
-  });
-
-  if (response.status === 301 || response.status === 302 || response.status === 307 || response.status === 308) {
-    const location = response.headers.get('location');
-    if (location) {
-      return location;
-    }
+async function handleNaiji(request: Request): Promise<Response> {
+  if (request.method !== 'GET') {
+    return errorResponse('仅支持 GET 请求', 405);
   }
 
-  // 没有重定向，返回原始 URL
-  return url;
+  const shareUrl =
+    `https://www.iesdouyin.com/share/user/${NAIJI_SEC_USER_ID}`;
+
+  try {
+    const response = await fetch(shareUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Linux; Android 13; Pixel 7) ' +
+          'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+          'Chrome/126.0.0.0 Mobile Safari/537.36',
+
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+
+        'Accept-Language':
+          'zh-CN,zh;q=0.9,en;q=0.8',
+
+        Referer: 'https://www.douyin.com/',
+      },
+    });
+
+    if (!response.ok) {
+      return errorResponse(
+        `请求 iesdouyin 用户页面失败: HTTP ${response.status}`,
+        502
+      );
+    }
+
+    const html = await response.text();
+
+    /**
+     * 找到 _ROUTER_DATA
+     */
+    const marker = 'window._ROUTER_DATA';
+
+    const markerIndex = html.indexOf(marker);
+
+    if (markerIndex === -1) {
+      return successResponse({
+        code: 502,
+        author: '赵乃吉',
+        sec_user_id: NAIJI_SEC_USER_ID,
+        message: '页面中没有找到 _ROUTER_DATA',
+        source: shareUrl,
+        html_length: html.length,
+      });
+    }
+
+    /**
+     * 找到 JSON 开始位置
+     *
+     * window._ROUTER_DATA = {...}
+     */
+    const jsonStart = html.indexOf(
+      '{',
+      markerIndex
+    );
+
+    if (jsonStart === -1) {
+      return successResponse({
+        code: 502,
+        author: '赵乃吉',
+        sec_user_id: NAIJI_SEC_USER_ID,
+        message: '未找到 _ROUTER_DATA JSON',
+        source: shareUrl,
+      });
+    }
+
+    const jsonText = extractJsonObject(
+      html,
+      jsonStart
+    );
+
+    if (!jsonText) {
+      return successResponse({
+        code: 502,
+        author: '赵乃吉',
+        sec_user_id: NAIJI_SEC_USER_ID,
+        message: '_ROUTER_DATA JSON 提取失败',
+        source: shareUrl,
+      });
+    }
+
+    const routerData = JSON.parse(jsonText);
+
+    /**
+     * 递归寻找作品对象
+     */
+    const awemes = findAwemeObjects(routerData);
+
+    if (awemes.length === 0) {
+      return successResponse({
+        code: 404,
+        author: '赵乃吉',
+        sec_user_id: NAIJI_SEC_USER_ID,
+        message: '没有从 _ROUTER_DATA 中找到作品数据',
+        source: shareUrl,
+        html_length: html.length,
+      });
+    }
+
+    /**
+     * 去重
+     */
+    const unique = new Map<string, any>();
+
+    for (const item of awemes) {
+      if (
+        item &&
+        typeof item.aweme_id === 'string'
+      ) {
+        unique.set(item.aweme_id, item);
+      }
+    }
+
+    const items = Array.from(unique.values());
+
+    /**
+     * 按发布时间倒序
+     */
+    items.sort((a, b) => {
+      const timeA = Number(a.create_time || 0);
+      const timeB = Number(b.create_time || 0);
+
+      return timeB - timeA;
+    });
+
+    const latest = items[0];
+
+    return successResponse({
+      code: 200,
+      author: '赵乃吉',
+      sec_user_id: NAIJI_SEC_USER_ID,
+
+      latest: {
+        aweme_id: latest.aweme_id || '',
+        desc: latest.desc || '',
+        create_time: Number(
+          latest.create_time || 0
+        ),
+
+        share_url:
+          latest.aweme_id
+            ? `https://www.douyin.com/video/${latest.aweme_id}`
+            : '',
+
+        author: {
+          nickname:
+            latest.author?.nickname || '赵乃吉',
+          uid:
+            latest.author?.uid ||
+            latest.author?.sec_uid ||
+            '',
+        },
+
+        statistics: {
+          digg_count:
+            Number(
+              latest.statistics?.digg_count || 0
+            ),
+
+          comment_count:
+            Number(
+              latest.statistics?.comment_count || 0
+            ),
+
+          share_count:
+            Number(
+              latest.statistics?.share_count || 0
+            ),
+
+          collect_count:
+            Number(
+              latest.statistics?.collect_count || 0
+            ),
+        },
+      },
+
+      total_found: items.length,
+
+      source: shareUrl,
+    });
+  } catch (error) {
+    return successResponse({
+      code: 500,
+      author: '赵乃吉',
+      sec_user_id: NAIJI_SEC_USER_ID,
+      message:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    });
+  }
 }
 
 /**
- * 从 HTML 字符串中提取完整的 JSON 对象
- * 通过跟踪大括号嵌套层级来确定 JSON 边界
- * @param html - HTML 字符串
- * @param startIndex - JSON 起始位置（'{' 的位置）
- * @returns JSON 字符串，解析失败返回 null
+ * 从 HTML 中提取完整 JSON 对象
+ *
+ * 与 parser.ts 的思路一致，
+ * 同时正确处理 JSON 字符串中的大括号。
  */
-function extractJsonObject(html: string, startIndex: number): string | null {
+function extractJsonObject(
+  html: string,
+  startIndex: number
+): string | null {
   let depth = 0;
-  let inStr = false;
+  let inString = false;
   let escape = false;
 
-  for (let i = startIndex; i < html.length; i++) {
+  for (
+    let i = startIndex;
+    i < html.length;
+    i++
+  ) {
     const c = html[i];
 
     if (escape) {
@@ -335,24 +394,30 @@ function extractJsonObject(html: string, startIndex: number): string | null {
       continue;
     }
 
-    if (c === '\\' && inStr) {
+    if (c === '\\' && inString) {
       escape = true;
       continue;
     }
 
     if (c === '"') {
-      inStr = !inStr;
+      inString = !inString;
       continue;
     }
 
-    if (inStr) continue;
+    if (inString) {
+      continue;
+    }
 
     if (c === '{') {
       depth++;
     } else if (c === '}') {
       depth--;
+
       if (depth === 0) {
-        return html.substring(startIndex, i + 1);
+        return html.substring(
+          startIndex,
+          i + 1
+        );
       }
     }
   }
@@ -361,124 +426,47 @@ function extractJsonObject(html: string, startIndex: number): string | null {
 }
 
 /**
- * 将 iesdouyin 返回的视频项映射为统一的 VideoInfo 结构
- * @param item - iesdouyin 视频项数据
- * @returns 标准化的视频信息
+ * 递归寻找包含 aweme_id 的作品对象
  */
-function mapIesdouyinItemToVideoInfo(item: IesdouyinItem): VideoInfo {
-  // 提取视频播放地址（带水印），然后去水印
-  const rawPlayAddr = extractCleanUrl(item.video.play_addr.url_list);
-  const playAddr = toWatermarkFreeUrl(rawPlayAddr);
-
-  // 提取封面图
-  const cover = extractCleanUrl(item.video.cover.url_list);
-
-  // 提取动态封面（可选字段）
-  const dynamicCover = item.video.dynamic_cover
-    ? extractCleanUrl(item.video.dynamic_cover.url_list)
-    : '';
-
-  // 提取作者头像（优先 medium，fallback thumb）
-  const avatar = item.author.avatar_medium
-    ? extractCleanUrl(item.author.avatar_medium.url_list)
-    : extractCleanUrl(item.author.avatar_thumb.url_list);
-
-  return {
-    videoId: item.aweme_id || '',
-    playAddr,
-    cover,
-    dynamicCover,
-    desc: item.desc || '',
-    duration: item.video.duration || 0,
-    author: {
-      uid: item.author.short_id || '',
-      nickname: item.author.nickname || '',
-      avatar: ensureHttps(avatar),
-      signature: item.author.signature || '',
-    },
-    stats: {
-      diggCount: item.statistics.digg_count || 0,
-      commentCount: item.statistics.comment_count || 0,
-      collectCount: item.statistics.collect_count || 0,
-      shareCount: item.statistics.share_count || 0,
-      playCount: item.statistics.play_count || 0,
-    },
-    createTime: item.create_time || 0,
-  };
-}
-
-/**
- * 通过抖音内部 API 获取视频详情（受限备选方案）
- * 注意：此 API 需要有效的 Cookie 和 X-Bogus 签名，当前大概率会失败
- * @param videoId - 视频 ID
- * @returns 视频信息
- */
-async function parseFromApi(videoId: string): Promise<VideoInfo> {
-  const apiUrl = `https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=${videoId}&aid=6383&cookie_enabled=true`;
-
-  const response = await fetch(apiUrl, {
-    method: 'GET',
-    headers: getDouyinApiHeaders(),
-  });
-
-  if (!response.ok) {
-    throw new Error(`请求抖音 API 失败: HTTP ${response.status}`);
+function findAwemeObjects(
+  value: unknown,
+  results: any[] = []
+): any[] {
+  if (!value || typeof value !== 'object') {
+    return results;
   }
 
-  const result = (await response.json()) as DouyinApiResponse;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      findAwemeObjects(item, results);
+    }
 
-  if (result.status_code !== 0 || !result.aweme_detail) {
-    throw new Error(
-      `抖音 API 返回异常: status_code=${result.status_code}`
+    return results;
+  }
+
+  const obj = value as Record<string, any>;
+
+  /**
+   * 判断是否是作品对象
+   */
+  if (
+    typeof obj.aweme_id === 'string' &&
+    obj.aweme_id.length > 0 &&
+    (
+      obj.create_time !== undefined ||
+      obj.desc !== undefined ||
+      obj.video !== undefined
+    )
+  ) {
+    results.push(obj);
+  }
+
+  for (const key of Object.keys(obj)) {
+    findAwemeObjects(
+      obj[key],
+      results
     );
   }
 
-  const videoInfo = mapAwemeDetailToVideoInfo(result.aweme_detail);
-
-  // 跟随 302 获取真实 CDN 播放地址
-  if (videoInfo.playAddr) {
-    try {
-      videoInfo.playAddr = await resolveRedirect(videoInfo.playAddr);
-    } catch {
-      // 解析失败则保留原始链接
-    }
-  }
-
-  return videoInfo;
-}
-
-/**
- * 将抖音 API 返回的原始数据映射为统一的 VideoInfo 结构
- * @param detail - 抖音 API 返回的视频详情
- * @returns 标准化的视频信息
- */
-function mapAwemeDetailToVideoInfo(detail: DouyinAwemeDetail): VideoInfo {
-  const rawPlayAddr = extractCleanUrl(detail.video.play_addr.url_list);
-  const playAddr = toWatermarkFreeUrl(rawPlayAddr);
-  const cover = extractCleanUrl(detail.video.cover.url_list);
-  const dynamicCover = extractCleanUrl(detail.video.dynamic_cover.url_list);
-  const avatar = extractCleanUrl(detail.author.avatar_larger.url_list);
-
-  return {
-    videoId: detail.aweme_id || '',
-    playAddr,
-    cover,
-    dynamicCover,
-    desc: detail.desc || '',
-    duration: detail.duration || 0,
-    author: {
-      uid: detail.author.uid || '',
-      nickname: detail.author.nickname || '',
-      avatar: ensureHttps(avatar),
-      signature: detail.author.signature || '',
-    },
-    stats: {
-      diggCount: detail.statistics.digg_count || 0,
-      commentCount: detail.statistics.comment_count || 0,
-      collectCount: detail.statistics.collect_count || 0,
-      shareCount: detail.statistics.share_count || 0,
-      playCount: detail.statistics.play_count || 0,
-    },
-    createTime: detail.create_time || 0,
-  };
+  return results;
 }
